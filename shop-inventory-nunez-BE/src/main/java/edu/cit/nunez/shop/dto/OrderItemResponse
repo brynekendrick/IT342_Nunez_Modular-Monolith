@@ -1,0 +1,21 @@
+package edu.cit.nunez.shop.dto;
+
+import edu.cit.nunez.inventory.Inventory;
+import java.util.List;
+public record OrderResponse(
+        Long orderId,
+        String status,
+        String reason,
+        List<OrderItemResponse> items,
+        List<Inventory> inventory
+) {
+    // Single item constructor
+    public OrderResponse(String status, String reason, Inventory inventory) {
+        this(null, status, reason, null, inventory != null ? List.of(inventory) : List.of());
+    }
+
+    // Status and reason constructor
+    public OrderResponse(String status, String reason) {
+        this(null, status, reason, null, List.of());
+    }
+}
