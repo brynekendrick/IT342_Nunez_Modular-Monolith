@@ -1,12 +1,10 @@
 package edu.cit.nunez.shop.dto;
 
+import java.util.List;
+
 public class OrderRequest {
-    private String productId;
-    private Integer quantity;
+    private List<OrderItemDto> items;
 
-    public String getProductId() { return productId; }
-    public void setProductId(String productId) { this.productId = productId; }
-
-    public Integer getQuantity() { return quantity; }
-    public void setQuantity(Integer quantity) { this.quantity = quantity; }
+    public List<OrderItemDto> getItems() { return items; }
+    public void setItems(List<OrderItemDto> items) { this.items = items; }
 }

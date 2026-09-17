@@ -33,4 +33,7 @@ public class Order {
     public String getStatus() { return status; }
     public String getReason() { return reason; }
     public ZonedDateTime getCreatedAt() { return createdAt; }
+
+    public void setStatus(String status) { this.status = status; }
+    public void setReason(String reason) { this.reason = reason; }
 }

@@ -1,21 +1,33 @@
 package edu.cit.nunez.inventory;
 
-import org.springframework.web.bind.annotation.*;
-import java.util.List;
 
-@RestController
-@RequestMapping("/api/inventory")
-@CrossOrigin(origins = "http://localhost:5173") // Enables React communication
-public class InventoryController {
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
 
-    private final InventoryService inventoryService;
+@Entity
+@Table(name = "inventory")
+public class Inventory {
 
-    public InventoryController(InventoryService inventoryService) {
-        this.inventoryService = inventoryService;
+    @Id
+    private String productId;
+    private String name;
+    private Integer stock;
+
+    public Inventory() {}
+
+    public Inventory(String productId, String name, Integer stock) {
+        this.productId = productId;
+        this.name = name;
+        this.stock = stock;
     }
 
-    @GetMapping
-    public List<Inventory> getInventory() {
-        return inventoryService.getAllItems();
-    }
+    public String getProductId() { return productId; }
+    public void setProductId(String productId) { this.productId = productId; }
+
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+
+    public Integer getStock() { return stock; }
+    public void setStock(Integer stock) { this.stock = stock; }
 }

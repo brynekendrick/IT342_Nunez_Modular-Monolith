@@ -1,14 +1,13 @@
 package edu.cit.nunez.shop.dto;
 
-import edu.cit.nunez.inventory.OrderItemDto;
 import java.util.List;
 
-public class MultipleItemOrderRequest {
+public class MultiItemOrderRequest {
     private List<OrderItemDto> items;
 
-    public MultipleItemOrderRequest() {}
+    public MultiItemOrderRequest() {}
 
-    public MultipleItemOrderRequest(List<OrderItemDto> items) {
+    public MultiItemOrderRequest(List<OrderItemDto> items) {
         this.items = items;
     }
 
