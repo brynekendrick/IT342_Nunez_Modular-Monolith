@@ -2,28 +2,18 @@ package edu.cit.nunez.shop.dto;
 
 public class OrderItemDto {
     private String productId;
-    private int quantity;
+    private Integer quantity;
 
     public OrderItemDto() {}
 
-    public OrderItemDto(String productId, int quantity) {
+    public OrderItemDto(String productId, Integer quantity) {
         this.productId = productId;
         this.quantity = quantity;
     }
 
-    public String getProductId() {
-        return productId;
-    }
+    public String getProductId() { return productId; }
+    public void setProductId(String productId) { this.productId = productId; }
 
-    public void setProductId(String productId) {
-        this.productId = productId;
-    }
-
-    public int getQuantity() {
-        return quantity;
-    }
-
-    public void setQuantity(int quantity) {
-        this.quantity = quantity;
-    }
+    public Integer getQuantity() { return quantity; }
+    public void setQuantity(Integer quantity) { this.quantity = quantity; }
 }

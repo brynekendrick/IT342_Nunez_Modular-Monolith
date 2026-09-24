@@ -1,12 +1,11 @@
-package edu.cit.nunez.inventory;
+    package edu.cit.nunez.inventory;
 
-import edu.cit.nunez.shop.dto.OrderItemDto;
-import java.util.List;
-import java.util.Optional;
+    import java.util.List;
+    import java.util.Optional;
 
-public interface InventoryService {
-    Optional<Inventory> getItem(String productId);
-    List<Inventory> getAllItems();
-    boolean reserveAll(List<OrderItemDto> items);
-    void restock(String productId, int quantity);
-}
+    public interface InventoryService {
+        List<Inventory> getAllItems();
+        Optional<Inventory> getItem(String productId);
+        boolean reserveAll(List<edu.cit.nunez.shop.dto.OrderItemDto> items);
+        void restock(String productId, int quantity);
+    }
