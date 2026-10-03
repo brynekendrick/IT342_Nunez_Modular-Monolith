@@ -31,3 +31,6 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Tiangge stable instance id (local) ###
+.tiangge-instance-id

@@ -8,4 +8,5 @@
         Optional<Inventory> getItem(String productId);
         boolean reserveAll(List<edu.cit.nunez.shop.dto.OrderItemDto> items);
         void restock(String productId, int quantity);
+
     }

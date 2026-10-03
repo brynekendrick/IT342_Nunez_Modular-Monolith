@@ -5,7 +5,8 @@ import java.time.ZonedDateTime;
 
 @Entity
 @Table(name = "supplier_orders")
-class SupplierOrder {
+@SuppressWarnings("unused")
+public class SupplierOrder {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -21,7 +22,7 @@ class SupplierOrder {
     @Enumerated(EnumType.STRING)
     private SupplierOrderStatus status;
 
-    private ZonedDateTime createdAt = ZonedDateTime.now();
+    private final ZonedDateTime createdAt = ZonedDateTime.now();
     private ZonedDateTime updatedAt = ZonedDateTime.now();
 
     public SupplierOrder() {}
@@ -38,10 +39,16 @@ class SupplierOrder {
     public Long getId() { return id; }
     public String getProductId() { return productId; }
     public String getBuyerRef() { return buyerRef; }
-    public void setBuyerRef(String buyerRef) { this.buyerRef = buyerRef; }
+    public void setBuyerRef(String buyerRef) {
+        this.buyerRef = buyerRef;
+        this.updatedAt = ZonedDateTime.now();
+    }
     public String getRequestId() { return requestId; }
     public String getPoNumber() { return poNumber; }
-    public void setPoNumber(String poNumber) { this.poNumber = poNumber; }
+    public void setPoNumber(String poNumber) {
+        this.poNumber = poNumber;
+        this.updatedAt = ZonedDateTime.now();
+    }
     public int getCases() { return cases; }
     public int getUnits() { return units; }
     public SupplierOrderStatus getStatus() { return status; }
@@ -49,4 +56,6 @@ class SupplierOrder {
         this.status = status;
         this.updatedAt = ZonedDateTime.now();
     }
+    public ZonedDateTime getCreatedAt() { return createdAt; }
+    public ZonedDateTime getUpdatedAt() { return updatedAt; }
 }

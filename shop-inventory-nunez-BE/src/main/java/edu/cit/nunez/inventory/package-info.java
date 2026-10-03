@@ -5,12 +5,15 @@ import edu.cit.nunez.supplier.OrderDeliveredEvent;
 import edu.cit.nunez.supplier.SupplierGateway;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.context.event.EventListener;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
 
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
 
 @Service
 class InventoryServiceImpl implements InventoryService {
@@ -19,10 +22,14 @@ class InventoryServiceImpl implements InventoryService {
 
     private final InventoryRepository inventoryRepository;
     private final SupplierGateway supplierGateway;
+    private final ApplicationEventPublisher eventPublisher;
 
-    InventoryServiceImpl(InventoryRepository inventoryRepository, SupplierGateway supplierGateway) {
+    InventoryServiceImpl(InventoryRepository inventoryRepository,
+                         SupplierGateway supplierGateway,
+                         ApplicationEventPublisher eventPublisher) {
         this.inventoryRepository = inventoryRepository;
         this.supplierGateway = supplierGateway;
+        this.eventPublisher = eventPublisher;
     }
 
     @Override
@@ -38,32 +45,55 @@ class InventoryServiceImpl implements InventoryService {
     @Override
     @Transactional
     public boolean reserveAll(List<OrderItemDto> items) {
-        // Step 1: Pre-check stock for all requested items to prevent partial updates
+        if (items == null || items.isEmpty()) {
+            return false;
+        }
+
+        // Aggregate quantities per SKU to handle duplicate items within the same order
+        Map<String, Integer> neededBySku = new LinkedHashMap<>();
         for (OrderItemDto item : items) {
-            Inventory inventory = inventoryRepository.findById(item.getProductId()).orElse(null);
-            if (inventory == null || inventory.getStock() < item.getQuantity()) {
-                log.warn("Reservation rejected: Product {} missing or insufficient stock (Requested: {}, Available: {})",
-                        item.getProductId(), item.getQuantity(), inventory != null ? inventory.getStock() : 0);
-                return false;
+            if (item.getProductId() != null && item.getQuantity() > 0) {
+                neededBySku.merge(item.getProductId(), item.getQuantity(), Integer::sum);
             }
         }
 
-        // Step 2: Deduct stock and check low-stock reorder thresholds
-        for (OrderItemDto item : items) {
-            Inventory inventory = inventoryRepository.findById(item.getProductId()).get();
-            int newStock = inventory.getStock() - item.getQuantity();
-            inventory.setStock(newStock);
-            inventoryRepository.save(inventory);
+        // Sort keys to prevent deadlocks across concurrent transactions
+        List<String> sortedSkus = new ArrayList<>(neededBySku.keySet());
+        Collections.sort(sortedSkus);
 
-            log.info("Reserved {} units for product {}. Remaining stock: {}", item.getQuantity(), item.getProductId(), newStock);
+        Map<String, Inventory> lockedMap = new HashMap<>();
+        for (String sku : sortedSkus) {
+            Inventory inv = inventoryRepository.findByIdForUpdate(sku).orElse(null);
+            int needed = neededBySku.get(sku);
+            if (inv == null || inv.getStock() < needed) {
+                log.warn("Reservation rejected: SKU {} missing or insufficient stock (needed: {}, available: {})",
+                        sku, needed, inv != null ? inv.getStock() : 0);
+                return false;
+            }
+            lockedMap.put(sku, inv);
+        }
 
-            // Trigger Supplier Adapter reorder if stock drops below 5 units
+        for (Map.Entry<String, Integer> entry : neededBySku.entrySet()) {
+            String sku = entry.getKey();
+            int qty = entry.getValue();
+            Inventory inv = lockedMap.get(sku);
+            int newStock = inv.getStock() - qty;
+            if (newStock < 0) {
+                log.error("OVERSELL GUARD TRIGGERED: SKU {} would go negative ({} - {}).", sku, inv.getStock(), qty);
+                throw new IllegalStateException("Oversell prevented for " + sku);
+            }
+            inv.setStock(newStock);
+            inventoryRepository.save(inv);
+            inventoryRepository.flush();
+
+            log.info("Reserved {} units for SKU {}. Remaining stock: {}", qty, sku, newStock);
+
             if (newStock < 5) {
-                log.info("Stock for product {} dropped below threshold ({}), requesting reorder from LegacySupply...", item.getProductId(), newStock);
+                log.info("Stock for SKU {} dropped below threshold ({}), queueing local reorder...", sku, newStock);
                 try {
-                    supplierGateway.requestReorder(item.getProductId(), 20);
+                    supplierGateway.requestReorder(sku, 20, false);
                 } catch (Exception e) {
-                    log.error("Failed to place reorder for product {} via SupplierGateway: {}", item.getProductId(), e.getMessage());
+                    log.error("Failed to queue reorder for SKU {}: {}", sku, e.getMessage());
                 }
             }
         }
@@ -74,17 +104,30 @@ class InventoryServiceImpl implements InventoryService {
     @Override
     @Transactional
     public void restock(String productId, int quantity) {
-        inventoryRepository.findById(productId).ifPresentOrElse(inventory -> {
+        inventoryRepository.findByIdForUpdate(productId).ifPresentOrElse(inventory -> {
             int previousStock = inventory.getStock();
-            inventory.setStock(previousStock + quantity);
+            int newStock = previousStock + quantity;
+            inventory.setStock(newStock);
             inventoryRepository.save(inventory);
-            log.info("Restocked product {}: {} -> {} (+{})", productId, previousStock, inventory.getStock(), quantity);
+            inventoryRepository.flush();
+            log.info("Restocked product {}: {} -> {} (+{})", productId, previousStock, newStock, quantity);
         }, () -> log.error("Cannot restock: Product {} not found in inventory", productId));
     }
 
-    @EventListener
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT, fallbackExecution = true)
+    @Order(1)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void handleSupplierOrderDelivered(OrderDeliveredEvent event) {
         log.info("Received OrderDeliveredEvent for product {}. Restocking {} units...", event.productId(), event.unitsToRestock());
-        restock(event.productId(), event.unitsToRestock());
+        String productId = event.productId();
+        int quantity = event.unitsToRestock();
+        inventoryRepository.findByIdForUpdate(productId).ifPresentOrElse(inventory -> {
+            int previousStock = inventory.getStock();
+            int newStock = previousStock + quantity;
+            inventory.setStock(newStock);
+            inventoryRepository.save(inventory);
+            inventoryRepository.flush();
+            log.info("Restocked product {}: {} -> {} (+{})", productId, previousStock, newStock, quantity);
+        }, () -> log.error("Cannot restock: Product {} not found in inventory", productId));
     }
 }

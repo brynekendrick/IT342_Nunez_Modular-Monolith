@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS orders (
     order_id BIGSERIAL PRIMARY KEY,
     status VARCHAR(20) NOT NULL, -- CONFIRMED, REJECTED, CANCELLED
     reason VARCHAR(255),
+    product_id VARCHAR(50),
+    quantity INT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -37,8 +39,31 @@ CREATE TABLE IF NOT EXISTS supplier_orders (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS tiangge_cursor (
+    id VARCHAR(100) PRIMARY KEY,
+    cursor_value BIGINT NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS tiangge_processed_events (
+    event_id VARCHAR(100) PRIMARY KEY,
+    order_id VARCHAR(50) NOT NULL,
+    event_type VARCHAR(50) NOT NULL,
+    processed_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tiangge_backorders (
+    id BIGSERIAL PRIMARY KEY,
+    tiangge_order_id VARCHAR(50) NOT NULL,
+    shop_order_id BIGINT NOT NULL,
+    product_id VARCHAR(50) NOT NULL,
+    quantity INT NOT NULL,
+    resolution_status VARCHAR(30) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE,
+    resolved_at TIMESTAMP WITH TIME ZONE
+);
+
 INSERT INTO inventory (product_id, name, stock) VALUES
 ('P100', 'Wireless Mouse', 20),
 ('P200', 'Mechanical Keyboard', 20),
 ('P300', 'USB-C Hub', 20)
-ON CONFLICT (product_id) DO UPDATE SET stock = EXCLUDED.stock, name = EXCLUDED.name;
+ON CONFLICT (product_id) DO NOTHING;

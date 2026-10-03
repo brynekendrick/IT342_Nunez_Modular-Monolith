@@ -1,7 +1,9 @@
 package edu.cit.nunez.supplier;
 
+import edu.cit.nunez.InstanceLifecycle;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.http.MediaType;
@@ -15,6 +17,7 @@ import org.springframework.web.client.RestClient;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Service
 class LegacySupplyAdapter implements SupplierGateway {
@@ -26,13 +29,15 @@ class LegacySupplyAdapter implements SupplierGateway {
     private final RestClient restClient;
     private final String apiKey;
     private final String clientId;
+    private final InstanceLifecycle instanceLifecycle;
 
     private String sessionToken = null;
+    private final AtomicBoolean polling = new AtomicBoolean(false);
 
     private static final Map<String, ProductMapping> PRODUCT_MAPPINGS = Map.of(
-            "P100", new ProductMapping("THP-5117", 10), // Wireless Mouse
-            "P200", new ProductMapping("THP-2478", 5),  // Mechanical Keyboard
-            "P300", new ProductMapping("THP-5129", 12)  // USB Hub 4-Port
+            "P100", new ProductMapping("THP-5117", 10),
+            "P200", new ProductMapping("THP-2478", 5),
+            "P300", new ProductMapping("THP-5129", 12)
     );
 
     record ProductMapping(String supplierSku, int packSize) {}
@@ -40,20 +45,24 @@ class LegacySupplyAdapter implements SupplierGateway {
     public LegacySupplyAdapter(
             SupplierOrderRepository repository,
             ApplicationEventPublisher eventPublisher,
+            @Qualifier("appInstanceId") String instanceId,
             @Value("${LS_API_KEY:LSK-D7CCC0B6BF5993F1C549}") String apiKey,
-            @Value("${LS_CLIENT_ID:23-1498-418}") String clientId) {
+            @Value("${LS_CLIENT_ID:23-1498-418}") String clientId,
+            InstanceLifecycle instanceLifecycle) {
 
         this.repository = repository;
         this.eventPublisher = eventPublisher;
         this.apiKey = apiKey;
         this.clientId = clientId;
+        this.instanceLifecycle = instanceLifecycle;
 
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
-        factory.setConnectTimeout(3000);
-        factory.setReadTimeout(3000);
+        factory.setConnectTimeout(4000);
+        factory.setReadTimeout(6000);
 
         this.restClient = RestClient.builder()
                 .baseUrl("https://legacysupply.onrender.com/api/v1")
+                .defaultHeader("X-Client-Instance", instanceId)
                 .requestFactory(factory)
                 .build();
     }
@@ -61,9 +70,53 @@ class LegacySupplyAdapter implements SupplierGateway {
     @Override
     @Transactional
     public SupplierOrderResult requestReorder(String productId, int unitsNeeded) {
+        // Default: non-blocking local queue (poller submits remotely).
+        return requestReorder(productId, unitsNeeded, false);
+    }
+
+    @Override
+    @Transactional
+    public SupplierOrderResult requestReorder(String productId, int unitsNeeded, boolean submitNow) {
         ProductMapping mapping = PRODUCT_MAPPINGS.get(productId);
         if (mapping == null) {
             return new SupplierOrderResult(null, null, null, SupplierOrderStatus.FAILED, "Unmapped product: " + productId);
+        }
+
+        // Check if an order already exists that is SUBMITTED, PROCESSING, or SHIPPED with poNumber
+        List<SupplierOrder> active = repository.findByProductIdAndStatusIn(
+                productId,
+                List.of(
+                        SupplierOrderStatus.SUBMITTED,
+                        SupplierOrderStatus.PROCESSING,
+                        SupplierOrderStatus.SHIPPED
+                )
+        );
+        for (SupplierOrder openOrder : active) {
+            if (openOrder.getPoNumber() != null && !openOrder.getPoNumber().isBlank()) {
+                return new SupplierOrderResult(
+                        openOrder.getId(), openOrder.getBuyerRef(), openOrder.getPoNumber(),
+                        openOrder.getStatus(), "Existing open PO reused");
+            }
+        }
+
+        // If there's a PENDING order, try to submit it if submitNow is true
+        List<SupplierOrder> pending = repository.findByProductIdAndStatusIn(
+                productId,
+                List.of(SupplierOrderStatus.PENDING)
+        );
+        if (!pending.isEmpty()) {
+            SupplierOrder existingPending = pending.get(0);
+            if (submitNow && instanceLifecycle != null && instanceLifecycle.isRegistered()) {
+                sendToLegacySupply(existingPending, mapping);
+                if (existingPending.getPoNumber() != null && !existingPending.getPoNumber().isBlank()) {
+                    return new SupplierOrderResult(
+                            existingPending.getId(), existingPending.getBuyerRef(), existingPending.getPoNumber(),
+                            existingPending.getStatus(), "Submitted");
+                }
+            }
+            return new SupplierOrderResult(
+                    existingPending.getId(), existingPending.getBuyerRef(), existingPending.getPoNumber(),
+                    existingPending.getStatus(), "Pending local PO");
         }
 
         int casesToOrder = (int) Math.ceil((double) unitsNeeded / (double) mapping.packSize());
@@ -76,53 +129,84 @@ class LegacySupplyAdapter implements SupplierGateway {
         order.setBuyerRef(buyerRef);
         repository.save(order);
 
-        sendToLegacySupply(order, mapping);
+        if (submitNow && instanceLifecycle != null && instanceLifecycle.isRegistered()) {
+            sendToLegacySupply(order, mapping);
+            if (order.getPoNumber() != null && !order.getPoNumber().isBlank()) {
+                return new SupplierOrderResult(order.getId(), order.getBuyerRef(), order.getPoNumber(), order.getStatus(), "Submitted");
+            }
+        }
 
-        return new SupplierOrderResult(order.getId(), order.getBuyerRef(), order.getPoNumber(), order.getStatus(), "Processed");
+        log.info("[LegacySupply] Queued local PENDING PO for {} (submitNow={})", productId, submitNow);
+        return new SupplierOrderResult(order.getId(), order.getBuyerRef(), order.getPoNumber(), order.getStatus(),
+                "Local PO queued");
+    }
+
+    @Override
+    public boolean hasActivePurchaseOrder(String productId) {
+        if (productId == null || productId.isBlank()) {
+            return false;
+        }
+
+        List<SupplierOrder> activeOrders = repository.findByProductIdAndStatusIn(
+                productId,
+                List.of(
+                        SupplierOrderStatus.SUBMITTED,
+                        SupplierOrderStatus.PROCESSING,
+                        SupplierOrderStatus.SHIPPED
+                )
+        );
+        return activeOrders.stream().anyMatch(o -> o.getPoNumber() != null && !o.getPoNumber().isBlank());
     }
 
     private synchronized void sendToLegacySupply(SupplierOrder order, ProductMapping mapping) {
-        try {
-            if (sessionToken == null) {
-                authenticate();
-            }
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            try {
+                if (sessionToken == null) {
+                    authenticate();
+                }
 
-            String xmlPayload = """
-                <PurchaseOrder>
-                  <SupplierSku>%s</SupplierSku>
-                  <Qty>%d</Qty>
-                  <BuyerRef>%s</BuyerRef>
-                </PurchaseOrder>
-                """.formatted(mapping.supplierSku(), order.getCases(), order.getBuyerRef());
+                String xmlPayload = """
+                    <PurchaseOrder>
+                      <SupplierSku>%s</SupplierSku>
+                      <Qty>%d</Qty>
+                      <BuyerRef>%s</BuyerRef>
+                    </PurchaseOrder>
+                    """.formatted(mapping.supplierSku(), order.getCases(), order.getBuyerRef());
 
-            String responseXml = restClient.post()
-                    .uri("/purchase-orders")
-                    .header("X-LS-Session", sessionToken)
-                    .header("X-Request-Id", order.getRequestId())
-                    .contentType(MediaType.APPLICATION_XML)
-                    .body(xmlPayload)
-                    .retrieve()
-                    .body(String.class);
+                String responseXml = restClient.post()
+                        .uri("/purchase-orders")
+                        .header("X-LS-Session", sessionToken)
+                        .header("X-Request-Id", order.getRequestId())
+                        .contentType(MediaType.APPLICATION_XML)
+                        .body(xmlPayload)
+                        .retrieve()
+                        .body(String.class);
 
-            String poNumber = extractXmlValue(responseXml, "PoNumber");
-            if (poNumber != null && !poNumber.isEmpty()) {
-                order.setPoNumber(poNumber);
-                order.setStatus(SupplierOrderStatus.SUBMITTED);
+                String poNumber = extractXmlValue(responseXml, "PoNumber");
+                if (poNumber != null && !poNumber.isEmpty()) {
+                    order.setPoNumber(poNumber);
+                    order.setStatus(SupplierOrderStatus.SUBMITTED);
+                    repository.save(order);
+                    log.info("Successfully created purchase order {} on LegacySupply", poNumber);
+                    return;
+                }
+            } catch (HttpClientErrorException.TooManyRequests e) {
+                log.warn("Rate limited (429) during PO submission. Will retry on next poll cycle.");
+                order.setStatus(SupplierOrderStatus.PENDING);
                 repository.save(order);
-                log.info("Successfully created purchase order {} on LegacySupply", poNumber);
+                return;
+            } catch (Exception e) {
+                log.error("LegacySupply purchase order submission failed (attempt {}): {}", attempt, e.getMessage());
+                if (e.getMessage() != null && (e.getMessage().contains("401") || e.getMessage().contains("E-AUTH"))) {
+                    sessionToken = null;
+                    if (attempt == 1) {
+                        continue; // retry immediately once with fresh token
+                    }
+                }
+                order.setStatus(SupplierOrderStatus.PENDING);
+                repository.save(order);
+                return;
             }
-
-        } catch (HttpClientErrorException.TooManyRequests e) {
-            log.warn("Rate limited (429) during PO submission. Retrying in background job.");
-            order.setStatus(SupplierOrderStatus.PENDING);
-            repository.save(order);
-        } catch (Exception e) {
-            log.error("LegacySupply purchase order submission failed: {}", e.getMessage());
-            if (e.getMessage() != null && (e.getMessage().contains("401") || e.getMessage().contains("E-AUTH"))) {
-                sessionToken = null;
-            }
-            order.setStatus(SupplierOrderStatus.PENDING);
-            repository.save(order);
         }
     }
 
@@ -143,39 +227,50 @@ class LegacySupplyAdapter implements SupplierGateway {
                 .body(String.class);
 
         this.sessionToken = extractXmlValue(responseXml, "SessionToken");
-        log.info("LegacySupply session token acquired: {}", sessionToken);
+        log.info("LegacySupply session token acquired: {}", sessionToken != null ? "SUCCESS" : "NULL");
     }
 
-    @Scheduled(fixedDelay = 20000) // Poll every 20 seconds
+    @SuppressWarnings("unused")
+    @Scheduled(fixedDelay = 4000, initialDelay = 2000)
     @Transactional
     public void pollOpenOrdersAndRetryPending() {
-        // 1. Retry PENDING orders
-        List<SupplierOrder> pendingOrders = repository.findByStatusIn(List.of(SupplierOrderStatus.PENDING));
-        for (SupplierOrder order : pendingOrders) {
-            ProductMapping mapping = PRODUCT_MAPPINGS.get(order.getProductId());
-            if (mapping != null) sendToLegacySupply(order, mapping);
+        if (instanceLifecycle == null || !instanceLifecycle.hasRecentHeartbeat()) {
+            return;
         }
-
-        // 2. Poll only active non-delivered orders
-        List<SupplierOrder> openOrders = repository.findByStatusIn(
-                List.of(SupplierOrderStatus.SUBMITTED, SupplierOrderStatus.PROCESSING, SupplierOrderStatus.SHIPPED)
-        );
-
-        for (SupplierOrder order : openOrders) {
-            pollSingleOrder(order.getPoNumber());
+        if (!polling.compareAndSet(false, true)) {
+            return;
         }
+        try {
+            List<SupplierOrder> pendingOrders = repository.findByStatusIn(List.of(SupplierOrderStatus.PENDING));
+            for (SupplierOrder order : pendingOrders) {
+                ProductMapping mapping = PRODUCT_MAPPINGS.get(order.getProductId());
+                if (mapping != null) {
+                    sendToLegacySupply(order, mapping);
+                }
+            }
 
-        // 3. FORCE POLL PO-100088 to satisfy the 'Noticed a cancelled order' requirement
-        pollSingleOrder("PO-100088");
+            List<SupplierOrder> openOrders = repository.findByStatusIn(
+                    List.of(SupplierOrderStatus.SUBMITTED, SupplierOrderStatus.PROCESSING, SupplierOrderStatus.SHIPPED)
+            );
+
+            for (SupplierOrder order : openOrders) {
+                pollSingleOrder(order.getPoNumber());
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        } finally {
+            polling.set(false);
+        }
     }
 
     private void pollSingleOrder(String poNumber) {
-        if (poNumber == null || poNumber.isEmpty()) return;
+        if (poNumber == null || poNumber.isBlank()) return;
 
         try {
-            // 3.5-second delay guarantees zero 429 rate limit responses
-            Thread.sleep(3500);
-
             if (sessionToken == null) {
                 authenticate();
             }
@@ -189,40 +284,34 @@ class LegacySupplyAdapter implements SupplierGateway {
             String statusCode = extractXmlValue(responseXml, "StatusCode");
             String statusText = extractXmlValue(responseXml, "Status");
 
-            // Handle CANCELLED (StatusCode 90)
             if ("90".equals(statusCode) || "CANCELLED".equalsIgnoreCase(statusText)) {
-                SupplierOrder order = repository.findAll().stream()
-                        .filter(o -> poNumber.equals(o.getPoNumber()))
-                        .findFirst().orElse(null);
-                if (order != null) {
+                repository.findByPoNumber(poNumber).ifPresent(order -> {
                     order.setStatus(SupplierOrderStatus.FAILED);
                     repository.save(order);
-                }
-                log.info("--> [LegacySupply] Order {} successfully polled as CANCELLED.", poNumber);
+                    log.info("--> [LegacySupply] Order {} polled as CANCELLED.", poNumber);
+                });
             }
-            // Handle DELIVERED (StatusCode 40)
             else if ("40".equals(statusCode) || "DELIVERED".equalsIgnoreCase(statusText)) {
-                SupplierOrder order = repository.findAll().stream()
-                        .filter(o -> poNumber.equals(o.getPoNumber()))
-                        .findFirst().orElse(null);
-                if (order != null && order.getStatus() != SupplierOrderStatus.DELIVERED) {
-                    order.setStatus(SupplierOrderStatus.DELIVERED);
-                    ProductMapping mapping = PRODUCT_MAPPINGS.get(order.getProductId());
-                    if (mapping != null) {
-                        eventPublisher.publishEvent(new OrderDeliveredEvent(order.getProductId(), order.getCases() * mapping.packSize()));
+                repository.findByPoNumber(poNumber).ifPresent(order -> {
+                    if (order.getStatus() != SupplierOrderStatus.DELIVERED) {
+                        order.setStatus(SupplierOrderStatus.DELIVERED);
+                        repository.save(order);
+                        ProductMapping mapping = PRODUCT_MAPPINGS.get(order.getProductId());
+                        if (mapping != null) {
+                            eventPublisher.publishEvent(new OrderDeliveredEvent(
+                                    order.getProductId(), order.getCases() * mapping.packSize()));
+                        }
+                        log.info("--> [LegacySupply] Order {} tracked to DELIVERED. Restock event published.", poNumber);
                     }
-                    repository.save(order);
-                    log.info("--> [LegacySupply] Order {} tracked to DELIVERED.", poNumber);
-                }
+                });
             }
 
         } catch (HttpClientErrorException.TooManyRequests e) {
-            log.warn("Rate limited (429). Waiting 15 seconds...");
-            try { Thread.sleep(15000); } catch (InterruptedException ignored) {}
+            log.warn("Rate limited (429) during status check. Skipping remaining polls this cycle.");
         } catch (Exception e) {
-            log.error("Error polling {}: {}", poNumber, e.getMessage());
+            log.error("Error polling PO {}: {}", poNumber, e.getMessage());
             if (e.getMessage() != null && (e.getMessage().contains("401") || e.getMessage().contains("E-AUTH"))) {
-                this.sessionToken = null; // Re-authenticate on next call
+                this.sessionToken = null;
             }
         }
     }
